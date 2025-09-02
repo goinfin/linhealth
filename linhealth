@@ -71,8 +71,8 @@ overall_exit() {
 }
 
 usage() {
-  cat <<'EOF'
-Usage: linhealth [--short] [--self-test] [--threshold-fs=80] [--threshold-inodes=80]
+  cat <<EOF
+Usage: linhealth [--self-test] [--threshold-fs=80] [--threshold-inodes=80]
                  [--timeout=1] [-h|--help]
 
 Options:
@@ -126,7 +126,11 @@ check_system() {
   kv "Boot since" "${boot_since:-unknown}"
 
   local cpu_threads=""
-  cpu_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  if have nproc; then
+    cpu_threads="$(nproc 2>/dev/null || true)"
+  else
+    cpu_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
   # Check for empty line or anomalous zeros
   if [[ -z "$cpu_threads" || "$cpu_threads" -lt 1 ]]; then
     if [[ -r /proc/cpuinfo ]]; then
@@ -164,12 +168,12 @@ check_fs_space() {
   print_section "Filesystems (space)"
   if ! have df; then kv "df" "not found"; inc_warn; return; fi
   local warn=0 crit=0 
-  while read -r type usep mount; do
+  while IFS=$'\t' read -r type usep mount; do
     printf '%-28s %s\n' "${mount} (${type}):" "${usep}"
     local p=${usep%%%}  # remove %
     if (( p >= CRIT_FS )); then crit=$(( crit + 1 )); fi
     if (( p >= WARN_FS && p < CRIT_FS )); then warn=$(( warn + 1 )); fi
-  done < <(LC_ALL=C df -P -T -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{print $2,$6,$7}')
+done < <(LC_ALL=C df -PT -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{type=$2; usep=$(NF-1); mount=$NF; print type "\t" usep "\t" mount}')
   if (( crit > 0 )); then echo "FS space: CRIT=$crit"; inc_crit; fi
   if (( warn > 0 )); then echo "FS space: WARN=$warn"; inc_warn; fi 
 }
@@ -178,12 +182,12 @@ check_fs_inodes() {
   print_section "Filesystems (inodes)"
   if ! have df; then kv "df -i" "not found"; inc_warn; return; fi
   local warn=0 crit=0
-  while read -r iusep mount; do
+  while IFS=$'\t' read -r iusep mount; do
     printf '%-28s %s\n' "${mount} (inodes):" "${iusep}"
     local p=${iusep%%%}  # remove %
     if (( p >= CRIT_INODE )); then crit=$(( crit + 1 )); fi
     if (( p >= WARN_INODE && p < CRIT_INODE )); then warn=$(( warn + 1 )); fi
-  done < <(LC_ALL=C df -Pi -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{print $5,$6}')
+done < <(LC_ALL=C df -Pi -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{print $(NF-1) "\t" $NF}')
   if (( crit > 0 )); then echo "Inodes: CRIT=$crit"; inc_crit; fi
   if (( warn > 0 )); then echo "Inodes: WARN=$warn"; inc_warn; fi
 }
@@ -209,7 +213,7 @@ check_network() {
     local gw
     gw=$(ip -4 route get "$PING_TARGET" 2>/dev/null | awk '/via/ {print $3; exit}')
     gw=${gw:-$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')}
-    kv "Default gateway:" "${gw:-unknown}"
+    kv "Default gateway" "${gw:-unknown}"
     echo "IP addresses:"
     ip -brief -color=never addr show scope global | sed 's/^/  /'
   else
@@ -276,9 +280,10 @@ check_logs() {
 self_test() {
   print_section "Self-test"
   local miss=0
-  for c in awk sed grep printf uname hostname ip getconf df; do
+  for c in awk sed grep printf uname hostname ip getconf df ping getent systemctl journalctl timedatectl; do
     if ! have "$c"; then echo "missing: $c"; miss=$(( miss + 1 )); fi
   done
+
   if (( miss > 0 )); then 
     echo "Self-test: WARN ($miss missing)"
     inc_warn
