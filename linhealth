@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# linhealth - lightweight bash-script for quick Linux-server (systemd) diagnostics
+# SPDX-License-Identifier: MIT
+# Version: 0.1
+
+# Strict mode
+set -Eeuo pipefail
+
+# ------- Default parameters -------
+WARN_FS=80             # warning if file system >= %
+CRIT_FS=90
+WARN_INODE=80
+CRIT_INODE=90
+PING_TARGET="77.88.8.8"
+DNS_TEST="ya.ru"
+SELFTEST=0
+TIMEOUT=1                # timeout of ping (sec)
+
+# ------- WARN/CRIT counters -------
+WARN_CNT=0
+CRIT_CNT=0
+
+# ------- Helper functions -------
+die() {
+  echo "ERROR: $*" >&2
+  exit 2
+}
+
+# shellcheck disable=SC2317  # called indirectly via: trap on_err ERR
+on_err() {
+  # ERR trap handler
+  echo "ERROR: failed at line $LINENO: $BASH_COMMAND" >&2
+}
+trap on_err ERR
+
+# If command exists - return 0, otherwise - 1
+have() { command -v "$1" >/dev/null 2>&1; }
+
+print_section() {
+  local title=$1
+  echo
+  echo "=== $title ==="
+}
+
+kv() {
+  # Output formating - "key: value"
+  local k=$1
+  local v=$2
+  printf '%-28s %s\n' "$k:" "$v"
+}
+
+# Increments
+inc_warn() { WARN_CNT=$((WARN_CNT+1)); }
+inc_crit() { CRIT_CNT=$((CRIT_CNT+1)); }
+
+# Single termination point; It returns a process exit code according to monitoring rules
+overall_exit() {
+  if (( CRIT_CNT > 0 )); then
+    echo
+    echo "OVERALL: CRITICAL ($CRIT_CNT)"
+    exit 2
+  elif (( WARN_CNT > 0 )); then
+    echo
+    echo "OVERALL: WARN ($WARN_CNT)"
+    exit 1
+  else
+    echo
+    echo "OVERALL: OK"
+    exit 0
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: linhealth [--short] [--self-test] [--threshold-fs=80] [--threshold-inodes=80]
+                 [--timeout=1] [-h|--help]
+
+Options:
+
+  -h, --help            Справочная информация
+  --self-test           Самопроверка скрипта и окружения
+  --threshold-fs=N      Порог предупреждения по заполненности ФС, % (CRIT = WARN + 10)
+  --threshold-inodes=N  Порог предупреждения по использованию инодов ФС, % (CRIT = WARN + 10)
+  --timeout=SEC         Таймаут сетевых проверок ping
+
+Коды возврата: 0=OK, 1=WARN, 2=CRIT  (по найденным проблемам)
+EOF
+}
+
+parse_args() {
+  # Parsing arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --self-test) SELFTEST=1 ;;
+      -h|--help) usage; exit 0 ;;
+      --threshold-fs=*) WARN_FS=${1#*=}; CRIT_FS=$((WARN_FS+10)) ;;
+      --threshold-inodes=*) WARN_INODE=${1#*=}; CRIT_INODE=$((WARN_INODE+10)) ;;
+      --timeout=*) TIMEOUT=${1#*=} ;;
+      *) die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+}
+
+# ------- Checking sections -------
+check_system() {
+  print_section "System"
+
+  local os="unknown"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/etc/os-release
+    . /etc/os-release
+    os=${PRETTY_NAME:-"${NAME:-Linux} ${VERSION_ID:-}"}
+  fi
+  kv "OS" "$os"
+
+  kv "Kernel" "$(uname -rms)"
+  kv "Hostname" "$(hostname)"
+
+  local up_pretty
+  up_pretty="$(uptime -p 2>/dev/null || true)"
+  kv "Uptime" "${up_pretty:-unknown}"
+
+  local boot_since
+  boot_since="$(uptime -s 2>/dev/null || true)"
+  kv "Boot since" "${boot_since:-unknown}"
+
+  local cpu_threads=""
+  cpu_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  # Check for empty line or anomalous zeros
+  if [[ -z "$cpu_threads" || "$cpu_threads" -lt 1 ]]; then
+    if [[ -r /proc/cpuinfo ]]; then
+      cpu_threads="$(grep -c ^processor /proc/cpuinfo 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "$cpu_threads" || "$cpu_threads" -lt 1 ]]; then
+    cpu_threads=1
+    inc_warn              # abnormal behavior - WARN
+  fi
+  kv "CPU (logical threads)" "$cpu_threads"
+
+  local loads
+  loads=$(awk '{print $1" "$2" "$3}' /proc/loadavg)
+  kv "Load Average (1/5/15)" "$loads"
+}
+
+check_memory() {
+  print_section "Memory/Swap"
+  local mt mf ma st sf
+  mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  mf=$(awk '/^MemFree:/{print $2}' /proc/meminfo)
+  ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+  st=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+  sf=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+  kv "Memory Total" "$((mt/1024)) MiB"
+  kv "Memory Free" "$((mf/1024)) MiB"
+  kv "Memory Available" "$((ma/1024)) MiB"
+  kv "Swap Total" "$((st/1024)) MiB"
+  kv "Swap Free" "$((sf/1024)) MiB"
+}
+
+check_fs_space() {
+  # Displays the percentage of FS filling and calculates thresholds exceeded
+  print_section "Filesystems (space)"
+  if ! have df; then kv "df" "not found"; inc_warn; return; fi
+  local warn=0 crit=0 
+  while read -r type usep mount; do
+    printf '%-28s %s\n' "${mount} (${type}):" "${usep}"
+    local p=${usep%%%}  # remove %
+    if (( p >= CRIT_FS )); then crit=$(( crit + 1 )); fi
+    if (( p >= WARN_FS && p < CRIT_FS )); then warn=$(( warn + 1 )); fi
+  done < <(LC_ALL=C df -P -T -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{print $2,$6,$7}')
+  if (( crit > 0 )); then echo "FS space: CRIT=$crit"; inc_crit; fi
+  if (( warn > 0 )); then echo "FS space: WARN=$warn"; inc_warn; fi 
+}
+
+check_fs_inodes() {
+  print_section "Filesystems (inodes)"
+  if ! have df; then kv "df -i" "not found"; inc_warn; return; fi
+  local warn=0 crit=0
+  while read -r iusep mount; do
+    printf '%-28s %s\n' "${mount} (inodes):" "${iusep}"
+    local p=${iusep%%%}  # remove %
+    if (( p >= CRIT_INODE )); then crit=$(( crit + 1 )); fi
+    if (( p >= WARN_INODE && p < CRIT_INODE )); then warn=$(( warn + 1 )); fi
+  done < <(LC_ALL=C df -Pi -x tmpfs -x devtmpfs -x efivarfs | awk 'NR>1{print $5,$6}')
+  if (( crit > 0 )); then echo "Inodes: CRIT=$crit"; inc_crit; fi
+  if (( warn > 0 )); then echo "Inodes: WARN=$warn"; inc_warn; fi
+}
+
+check_services() {
+  print_section "Systemd services"
+  if have systemctl; then
+    local cnt
+    cnt=$(systemctl --failed --no-legend | sed '/^[[:space:]]*$/d' | wc -l || true)
+    kv "Failed units" "$cnt"
+    if (( cnt > 0 )); then
+      inc_warn
+      systemctl --failed --no-legend | head -n 10
+    fi
+  else
+    kv "systemctl" "not found"; inc_warn
+  fi
+}
+
+check_network() {
+  print_section "Network"
+  if have ip; then
+    local gw
+    gw=$(ip -4 route get "$PING_TARGET" 2>/dev/null | awk '/via/ {print $3; exit}')
+    gw=${gw:-$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')}
+    kv "Default gateway:" "${gw:-unknown}"
+    echo "IP addresses:"
+    ip -brief -color=never addr show scope global | sed 's/^/  /'
+  else
+    kv "iproute2" "not found"; inc_warn
+  fi
+
+  # DNS and reachability
+  local dns_ok="no"
+  if have getent; then
+    if getent hosts "$DNS_TEST" >/dev/null 2>&1; then dns_ok="yes"; fi
+  elif have resolvectl; then
+    if resolvectl query "$DNS_TEST" >/dev/null 2>&1; then dns_ok="yes"; fi
+  fi
+  if [[ "$dns_ok" != "yes" ]]; then inc_warn; fi
+  kv "DNS resolve $DNS_TEST" "$dns_ok"
+
+  local ping_ok="no"
+  if have ping; then
+    if ping -c1 -W "$TIMEOUT" -n "$PING_TARGET" >/dev/null 2>&1; then ping_ok="yes"; fi
+    kv "Ping $PING_TARGET" "$ping_ok"
+    if [[ $ping_ok != "yes" ]]; then inc_warn; fi
+  else
+    kv "ping" "not found"; inc_warn
+  fi
+}
+
+check_time() {
+  print_section "Time"
+  if have timedatectl; then
+    local sync
+    sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "unknown")
+    kv "NTP synchronized" "$sync"
+    if [[ "$sync" != "yes" ]]; then inc_warn; fi
+  else
+    kv "timedatectl" "not found"; inc_warn
+  fi
+}
+
+check_logs() {
+  print_section "Recent errors (journal)"
+  if have journalctl; then
+    local base_args=(-p err -b --no-pager -q)
+    local LOG_TAIL=20
+    local n
+
+    n=$(journalctl "${base_args[@]}" -o json 2>/dev/null | wc -l || true)
+    kv "Errors count (this boot)" "$n"
+
+    if (( n > 0 )); then
+      inc_warn
+      # Show recent N entries in a clear format
+      journalctl "${base_args[@]}" -n "$LOG_TAIL"
+    fi
+
+    # Hint: without these groups not all messages are visible
+    if ! id -nG 2>/dev/null | grep -qwE 'adm|systemd-journal'; then
+      kv "Note" "partial logs (join adm/systemd-journal or use sudo)" 
+    fi 
+  else
+    kv "journalctl" "not found"; inc_warn
+  fi
+}
+
+self_test() {
+  print_section "Self-test"
+  local miss=0
+  for c in awk sed grep printf uname hostname ip getconf df; do
+    if ! have "$c"; then echo "missing: $c"; miss=$(( miss + 1 )); fi
+  done
+  if (( miss > 0 )); then 
+    echo "Self-test: WARN ($miss missing)"
+    inc_warn
+  else
+    echo "Self-test: OK"
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  if (( SELFTEST == 1 )); then
+    self_test
+    overall_exit
+  fi
+
+  check_system
+  check_memory
+  check_fs_space
+  check_fs_inodes
+  check_services
+  check_network
+  check_time
+  check_logs
+  overall_exit
+}
+
+main "$@"
+
