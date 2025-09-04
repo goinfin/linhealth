@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # linhealth - lightweight bash-script for quick Linux-server (systemd) diagnostics
 # SPDX-License-Identifier: MIT
-# Version: 0.1
+readonly SCRIPT_VERSION="0.2"
 
 # Strict mode
 set -Eeuo pipefail
@@ -73,10 +73,11 @@ overall_exit() {
 usage() {
   cat <<EOF
 Usage: linhealth [--self-test] [--threshold-fs=80] [--threshold-inodes=80]
-                 [--timeout=1] [-h|--help]
+                 [--timeout=1] [-h|--help] [--version]
 
 Options:
 
+  --version             Версия скрипта
   -h, --help            Справочная информация
   --self-test           Самопроверка скрипта и окружения
   --threshold-fs=N      Порог предупреждения по заполненности ФС, % (CRIT = WARN + 10)
@@ -91,6 +92,7 @@ parse_args() {
   # Parsing arguments
   while [ $# -gt 0 ]; do
     case "$1" in
+      --version) echo "$SCRIPT_VERSION"; exit 0 ;;
       --self-test) SELFTEST=1 ;;
       -h|--help) usage; exit 0 ;;
       --threshold-fs=*) WARN_FS=${1#*=}; CRIT_FS=$((WARN_FS+10)) ;;
@@ -105,6 +107,7 @@ parse_args() {
 # ------- Checking sections -------
 check_system() {
   print_section "System"
+  kv "Script path" "$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
   local os="unknown"
   if [[ -r /etc/os-release ]]; then
@@ -210,9 +213,13 @@ check_services() {
 check_network() {
   print_section "Network"
   if have ip; then
-    local gw
-    gw=$(ip -4 route get "$PING_TARGET" 2>/dev/null | awk '/via/ {print $3; exit}')
-    gw=${gw:-$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')}
+    local gw="" out=""
+    if out=$(ip -4 route get "$PING_TARGET" 2>/dev/null); then
+      gw=$(awk '/ via / {print $3; exit}' <<<"$out")
+    else
+      out=$(ip -4 route show default 2>/dev/null || true)
+      gw=$(awk '/^default / {print $3; exit}' <<<"$out")
+    fi
     kv "Default gateway" "${gw:-unknown}"
     echo "IP addresses:"
     ip -brief -color=never addr show scope global | sed 's/^/  /'
